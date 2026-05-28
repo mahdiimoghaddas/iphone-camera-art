@@ -70,34 +70,107 @@
       opacity: 0.75;
       letter-spacing: 0.04em;
     }
+
+    #controls {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 20;
+      display: none;
+      gap: 10px;
+      align-items: center;
+    }
+
+    #controls button {
+      padding: 10px 14px;
+      font-size: 13px;
+      border: 1px solid #15994e;
+      background: rgba(0, 0, 0, 0.78);
+      color: #15994e;
+      border-radius: 999px;
+      letter-spacing: 0.03em;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+
+    #controls button:active {
+      transform: scale(0.97);
+    }
+
+    #controls button.recording {
+      background: rgba(21, 153, 78, 0.28);
+      box-shadow: 0 0 16px rgba(21, 153, 78, 0.35);
+    }
+
+    #flash {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      pointer-events: none;
+      background: white;
+      opacity: 0;
+      transition: opacity 160ms ease;
+    }
   </style>
+
+  <link rel="manifest" href="./manifest.json" />
+  <meta name="theme-color" content="#15994e" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Line Camera" />
 </head>
 
 <body>
   <button id="startButton">Start Camera</button>
   <div id="status">waiting</div>
-  <div id="info">line vision / object detection</div>
+  <div id="info">real image / green detection / face landmarks</div>
+  <div id="controls">
+    <button id="photoButton">Take Photo</button>
+    <button id="recordButton">Start Recording</button>
+  </div>
+  <div id="flash"></div>
+
 
   <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
 
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+  <script src="./libs/tf.min.js"></script>
+  <script src="./libs/coco-ssd.min.js"></script>
 
-  <script>
+  <script type="module">
+    import {
+      FaceLandmarker,
+      FilesetResolver
+    } from "./libs/tasks-vision/vision_bundle.mjs";
+
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
 
     const startButton = document.getElementById("startButton");
     const statusText = document.getElementById("status");
+    const controls = document.getElementById("controls");
+    const photoButton = document.getElementById("photoButton");
+    const recordButton = document.getElementById("recordButton");
+    const flash = document.getElementById("flash");
 
     let model;
+    let faceLandmarker;
     let lastPredictions = [];
+    let lastFaceResults = null;
     let frameCount = 0;
-    let detecting = false;
+    let detectingObjects = false;
+    let detectingFace = false;
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let isRecording = false;
 
     const GREEN = "#15994e";
+
+    // Lower = more sensitive, but more mistakes.
+    // Try 0.08 for maximum sensitivity, 0.12 balanced, 0.18 cleaner.
+    const OBJECT_SCORE_THRESHOLD = 0.12;
+    const MAX_OBJECTS = 50;
 
     const labelMap = {
       "person": "person",
@@ -132,6 +205,31 @@
       "microwave": "microwave"
     };
 
+    const FACE_PARTS = {
+      faceOval: [
+        10, 338, 297, 332, 284, 251, 389, 356, 454, 323,
+        361, 288, 397, 365, 379, 378, 400, 377, 152, 148,
+        176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
+        162, 21, 54, 103, 67, 109, 10
+      ],
+      leftEye: [33, 160, 158, 133, 153, 144, 33],
+      rightEye: [362, 385, 387, 263, 373, 380, 362],
+      leftIris: [468, 469, 470, 471, 472, 468],
+      rightIris: [473, 474, 475, 476, 477, 473],
+      leftBrow: [70, 63, 105, 66, 107],
+      rightBrow: [336, 296, 334, 293, 300],
+      lipsOuter: [
+        61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+        291, 308, 324, 318, 402, 317, 14, 87, 178, 88,
+        95, 61
+      ],
+      lipsInner: [
+        78, 191, 80, 81, 82, 13, 312, 311, 310, 415,
+        308, 324, 318, 402, 317, 14, 87, 178, 88, 95, 78
+      ],
+      nose: [168, 6, 197, 195, 5, 4, 1]
+    };
+
     function resizeCanvas() {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
@@ -143,16 +241,34 @@
     async function startCamera() {
       try {
         startButton.style.display = "none";
-        statusText.textContent = "loading model";
+        statusText.textContent = "loading object model";
 
-        console.log("Loading model...");
+        console.log("Loading COCO-SSD model...");
+        model = await window.cocoSsd.load({
+          base: "mobilenet_v2",
+          modelUrl: "./models/coco-ssd/model.json"
+        });
+        console.log("COCO-SSD loaded:", model);
 
-        model = await cocoSsd.load({
-          base: "mobilenet_v2"
+        statusText.textContent = "loading face model";
+        console.log("Loading Face Landmarker...");
+
+        const vision = await FilesetResolver.forVisionTasks(
+          "./libs/tasks-vision/wasm"
+        );
+
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "./models/face_landmarker.task",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numFaces: 1,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: false
         });
 
-        console.log("Model loaded:", model);
-
+        console.log("Face Landmarker loaded:", faceLandmarker);
         statusText.textContent = "starting camera";
 
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -168,96 +284,91 @@
 
         video.onloadedmetadata = () => {
           video.play();
-
           console.log("Video size:", video.videoWidth, video.videoHeight);
-
           statusText.textContent = "camera active";
+          controls.style.display = "flex";
           draw();
         };
       } catch (error) {
         console.error(error);
-        statusText.textContent = "error: check camera permission";
+
+        // If GPU fails on some iPhones, try CPU for face landmarks.
+        if (String(error).includes("GPU") || String(error).includes("delegate")) {
+          statusText.textContent = "face GPU failed, trying CPU";
+          try {
+            const vision = await FilesetResolver.forVisionTasks("./libs/tasks-vision/wasm");
+            faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+              baseOptions: {
+                modelAssetPath: "./models/face_landmarker.task",
+                delegate: "CPU"
+              },
+              runningMode: "VIDEO",
+              numFaces: 1,
+              outputFaceBlendshapes: false,
+              outputFacialTransformationMatrixes: false
+            });
+            statusText.textContent = "reload and start again";
+          } catch (cpuError) {
+            console.error(cpuError);
+            statusText.textContent = "face model error";
+          }
+        } else {
+          statusText.textContent = "error: check files / permission";
+        }
+
         startButton.style.display = "block";
       }
     }
 
-    function drawFaintRealImage() {
-      ctx.globalAlpha = 0.04;
+    function drawRealImage() {
+      ctx.globalAlpha = 1;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       ctx.globalAlpha = 1;
+
+      // Dark overlay keeps the green detection lines visible while preserving the real camera image.
+      ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
 
-    function drawLineImage() {
-      if (!video.videoWidth || !video.videoHeight) return;
+    async function updateObjectDetection() {
+      if (!model || video.readyState !== 4 || detectingObjects) return;
 
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-
-      const offCanvas = document.createElement("canvas");
-      offCanvas.width = vw;
-      offCanvas.height = vh;
-
-      const offCtx = offCanvas.getContext("2d", { willReadFrequently: true });
-      offCtx.drawImage(video, 0, 0, vw, vh);
-
-      const imageData = offCtx.getImageData(0, 0, vw, vh);
-      const data = imageData.data;
-
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-
-        const brightness = (r + g + b) / 3;
-
-        if (brightness > 65 && brightness < 165) {
-          data[i] = 21;
-          data[i + 1] = 153;
-          data[i + 2] = 78;
-          data[i + 3] = 52;
-        } else if (brightness >= 165) {
-          data[i] = 255;
-          data[i + 1] = 255;
-          data[i + 2] = 255;
-          data[i + 3] = 18;
-        } else {
-          data[i] = 0;
-          data[i + 1] = 0;
-          data[i + 2] = 0;
-          data[i + 3] = 10;
-        }
-      }
-
-      offCtx.putImageData(imageData, 0, 0);
-
-      ctx.globalAlpha = 0.32;
-      ctx.drawImage(offCanvas, 0, 0, canvas.width, canvas.height);
-      ctx.globalAlpha = 1;
-    }
-
-    async function updateDetection() {
-      if (!model || video.readyState !== 4 || detecting) return;
-
-      // هر ۱۰ فریم یک بار تشخیص بده تا روی آیفون کند نشه
+      // Object detection is heavier, so it runs every 10 frames.
       if (frameCount % 10 !== 0) return;
 
-      detecting = true;
+      detectingObjects = true;
 
       try {
-        const predictions = await model.detect(video);
+        const predictions = await model.detect(video, MAX_OBJECTS, OBJECT_SCORE_THRESHOLD);
+        console.log("objects:", predictions);
 
-        console.log(predictions);
-
-        // threshold پایین‌تر برای detect کردن اشیای بیشتر
-        lastPredictions = predictions.filter(prediction => prediction.score > 0.15);
-
-        statusText.textContent = `detected: ${lastPredictions.length}`;
+        lastPredictions = predictions.filter(
+          prediction => prediction.score > OBJECT_SCORE_THRESHOLD
+        );
       } catch (error) {
         console.error("Detection error:", error);
-        statusText.textContent = "detection error";
+        statusText.textContent = "object detection error";
       }
 
-      detecting = false;
+      detectingObjects = false;
+    }
+
+    async function updateFaceLandmarks() {
+      if (!faceLandmarker || video.readyState !== 4 || detectingFace) return;
+
+      // Face landmark is lighter and should feel responsive.
+      if (frameCount % 2 !== 0) return;
+
+      detectingFace = true;
+
+      try {
+        const now = performance.now();
+        lastFaceResults = faceLandmarker.detectForVideo(video, now);
+      } catch (error) {
+        console.error("Face landmark error:", error);
+      }
+
+      detectingFace = false;
     }
 
     function drawObjectDetection(prediction) {
@@ -278,18 +389,14 @@
 
       const label = labelMap[prediction.class] || prediction.class;
       const percent = Math.round(prediction.score * 100);
-
-      // اگر تشخیص خیلی ضعیف باشه، باکس نازک‌تر میشه
-      const alpha = Math.min(Math.max(prediction.score, 0.25), 0.95);
+      const alpha = Math.min(Math.max(prediction.score, 0.35), 0.95);
 
       ctx.strokeStyle = `rgba(21, 153, 78, ${alpha})`;
-      ctx.lineWidth = 1.3;
+      ctx.lineWidth = 1.4;
       ctx.strokeRect(sx, sy, sw, sh);
 
-      // graphic corner marks
       const corner = 20;
       ctx.lineWidth = 2.5;
-
       ctx.beginPath();
 
       ctx.moveTo(sx, sy + corner);
@@ -307,10 +414,8 @@
       ctx.moveTo(sx + corner, sy + sh);
       ctx.lineTo(sx, sy + sh);
       ctx.lineTo(sx, sy + sh - corner);
-
       ctx.stroke();
 
-      // center cross
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(cx - 9, cy);
@@ -319,18 +424,19 @@
       ctx.lineTo(cx, cy + 9);
       ctx.stroke();
 
-      // slight scan line through the object
       ctx.strokeStyle = "rgba(21, 153, 78, 0.22)";
-      ctx.lineWidth = 1;
-
       ctx.beginPath();
       ctx.moveTo(sx, cy);
       ctx.lineTo(sx + sw, cy);
       ctx.stroke();
 
-      // label
-      const text = `${label} ${percent}%`;
+      let extra = "";
+      if (prediction.class === "person") {
+        const bodyArea = Math.round((sw * sh) / (canvas.width * canvas.height) * 100);
+        extra = ` / area ${bodyArea}%`;
+      }
 
+      const text = `${label} ${percent}%${extra}`;
       ctx.font = "14px Arial";
       const textWidth = ctx.measureText(text).width;
 
@@ -339,44 +445,261 @@
 
       ctx.fillStyle = "rgba(21, 153, 78, 1)";
       ctx.fillText(text, sx + 7, Math.max(sy - 12, 17));
+    }
 
-      // subtle object presence lines
-      ctx.strokeStyle = "rgba(21, 153, 78, 0.24)";
-      ctx.lineWidth = 1;
+    function drawFaceLandmarks() {
+      if (!lastFaceResults || !lastFaceResults.faceLandmarks) return;
+      if (!video.videoWidth || !video.videoHeight) return;
 
-      for (let i = 0; i < 2; i++) {
-        const dx = (Math.random() - 0.5) * 32;
-        const dy = (Math.random() - 0.5) * 32;
+      const scaleX = canvas.width / video.videoWidth;
+      const scaleY = canvas.height / video.videoHeight;
+
+      ctx.strokeStyle = "rgba(21, 153, 78, 0.96)";
+      ctx.fillStyle = "rgba(21, 153, 78, 0.96)";
+      ctx.lineWidth = 1.4;
+
+      for (const landmarks of lastFaceResults.faceLandmarks) {
+        drawFacePath(landmarks, FACE_PARTS.faceOval, scaleX, scaleY, true);
+        drawFacePath(landmarks, FACE_PARTS.leftEye, scaleX, scaleY, true);
+        drawFacePath(landmarks, FACE_PARTS.rightEye, scaleX, scaleY, true);
+
+        if (landmarks.length > 477) {
+          drawFacePath(landmarks, FACE_PARTS.leftIris, scaleX, scaleY, true);
+          drawFacePath(landmarks, FACE_PARTS.rightIris, scaleX, scaleY, true);
+        }
+
+        drawFacePath(landmarks, FACE_PARTS.leftBrow, scaleX, scaleY, false);
+        drawFacePath(landmarks, FACE_PARTS.rightBrow, scaleX, scaleY, false);
+        drawFacePath(landmarks, FACE_PARTS.lipsOuter, scaleX, scaleY, true);
+        drawFacePath(landmarks, FACE_PARTS.lipsInner, scaleX, scaleY, true);
+        drawFacePath(landmarks, FACE_PARTS.nose, scaleX, scaleY, false);
+
+        drawSmallPoints(landmarks, [1, 4, 13, 14, 33, 133, 263, 362], scaleX, scaleY);
+        drawFaceLabel(landmarks, scaleX, scaleY);
+      }
+    }
+
+    function drawFacePath(landmarks, indices, scaleX, scaleY, closePath) {
+      ctx.beginPath();
+
+      indices.forEach((index, i) => {
+        const point = landmarks[index];
+        if (!point) return;
+
+        const x = point.x * video.videoWidth * scaleX;
+        const y = point.y * video.videoHeight * scaleY;
+
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+
+      if (closePath) ctx.closePath();
+      ctx.stroke();
+    }
+
+    function drawSmallPoints(landmarks, indices, scaleX, scaleY) {
+      for (const index of indices) {
+        const point = landmarks[index];
+        if (!point) continue;
+
+        const x = point.x * video.videoWidth * scaleX;
+        const y = point.y * video.videoHeight * scaleY;
 
         ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(cx + dx, cy + dy);
-        ctx.stroke();
+        ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+        ctx.fill();
       }
+    }
+
+    function drawFaceLabel(landmarks, scaleX, scaleY) {
+      const nose = landmarks[1];
+      if (!nose) return;
+
+      const x = nose.x * video.videoWidth * scaleX;
+      const y = nose.y * video.videoHeight * scaleY;
+      const text = "face / eyes / lips";
+
+      ctx.font = "13px Arial";
+      const textWidth = ctx.measureText(text).width;
+
+      ctx.fillStyle = "rgba(0, 0, 0, 0.72)";
+      ctx.fillRect(x + 10, y - 22, textWidth + 14, 22);
+
+      ctx.fillStyle = "rgba(21, 153, 78, 1)";
+      ctx.fillText(text, x + 17, y - 6);
+    }
+
+
+
+    function flashScreen() {
+      flash.style.opacity = "0.55";
+      window.setTimeout(() => {
+        flash.style.opacity = "0";
+      }, 120);
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.rel = "noopener";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      window.setTimeout(() => {
+        URL.revokeObjectURL(url);
+      }, 1000);
+    }
+
+    function takePhoto() {
+      if (!canvas.width || !canvas.height) {
+        statusText.textContent = "photo failed";
+        return;
+      }
+
+      canvas.toBlob(blob => {
+        if (!blob) {
+          statusText.textContent = "photo failed";
+          return;
+        }
+
+        downloadBlob(blob, `line-camera-photo-${Date.now()}.png`);
+        flashScreen();
+        statusText.textContent = "photo saved";
+      }, "image/png");
+    }
+
+    function getSupportedRecordingOptions() {
+      if (typeof MediaRecorder === "undefined") return null;
+
+      const candidates = [
+        "video/mp4;codecs=h264",
+        "video/mp4",
+        "video/webm;codecs=vp9",
+        "video/webm;codecs=vp8",
+        "video/webm"
+      ];
+
+      for (const mimeType of candidates) {
+        if (MediaRecorder.isTypeSupported(mimeType)) {
+          return { mimeType };
+        }
+      }
+
+      return {};
+    }
+
+    function startRecording() {
+      if (!canvas.captureStream || typeof MediaRecorder === "undefined") {
+        statusText.textContent = "recording not supported";
+        return;
+      }
+
+      const options = getSupportedRecordingOptions();
+      if (options === null) {
+        statusText.textContent = "recording not supported";
+        return;
+      }
+
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+
+      try {
+        mediaRecorder = new MediaRecorder(stream, options);
+      } catch (error) {
+        console.error("MediaRecorder error:", error);
+        statusText.textContent = "recording failed";
+        return;
+      }
+
+      mediaRecorder.ondataavailable = event => {
+        if (event.data && event.data.size > 0) {
+          recordedChunks.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = saveRecording;
+      mediaRecorder.start(1000);
+
+      isRecording = true;
+      recordButton.textContent = "Stop Recording";
+      recordButton.classList.add("recording");
+      statusText.textContent = "recording";
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+
+      isRecording = false;
+      recordButton.textContent = "Start Recording";
+      recordButton.classList.remove("recording");
+      statusText.textContent = "saving recording";
+    }
+
+    function saveRecording() {
+      if (!recordedChunks.length) {
+        statusText.textContent = "no recording data";
+        return;
+      }
+
+      const mimeType = mediaRecorder?.mimeType || "video/webm";
+      const extension = mimeType.includes("mp4") ? "mp4" : "webm";
+      const blob = new Blob(recordedChunks, { type: mimeType });
+
+      downloadBlob(blob, `line-camera-recording-${Date.now()}.${extension}`);
+      statusText.textContent = "recording saved";
     }
 
     async function draw() {
       frameCount++;
-
-      // مقدار بالاتر یعنی تصویر قبلی سریع‌تر محو می‌شود
-      ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       if (video.readyState === 4 && video.videoWidth > 0) {
-        drawFaintRealImage();
-        drawLineImage();
+        drawRealImage();
 
-        await updateDetection();
+        await updateObjectDetection();
+        await updateFaceLandmarks();
 
         lastPredictions.forEach(prediction => {
           drawObjectDetection(prediction);
         });
+
+        drawFaceLandmarks();
+
+        const faceCount = lastFaceResults?.faceLandmarks?.length || 0;
+        statusText.textContent = `objects: ${lastPredictions.length} / faces: ${faceCount}`;
       }
 
       requestAnimationFrame(draw);
     }
 
     startButton.addEventListener("click", startCamera);
+    photoButton.addEventListener("click", takePhoto);
+    recordButton.addEventListener("click", () => {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
+  </script>
+
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker
+          .register("./service-worker.js")
+          .then(() => console.log("Service Worker registered"))
+          .catch(error => console.log("Service Worker error:", error));
+      });
+    }
   </script>
 </body>
 </html>
