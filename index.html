@@ -3,18 +3,23 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Abstract Object Camera</title>
+
+  <title>Line Object Detection Camera</title>
 
   <style>
     body {
       margin: 0;
       overflow: hidden;
       background: black;
-      font-family: Arial, sans-serif;
+      font-family: Arial, Helvetica, sans-serif;
     }
 
     video {
-      display: none;
+      position: fixed;
+      opacity: 0;
+      pointer-events: none;
+      width: 1px;
+      height: 1px;
     }
 
     canvas {
@@ -34,52 +39,97 @@
       padding: 16px 24px;
       font-size: 18px;
       border: 1px solid #15994e;
-      background: black;
+      background: rgba(0, 0, 0, 0.9);
       color: #15994e;
       border-radius: 999px;
+      letter-spacing: 0.04em;
+    }
+
+    #status {
+      position: fixed;
+      left: 16px;
+      top: 16px;
+      z-index: 5;
+      color: #15994e;
+      font-size: 12px;
+      opacity: 0.9;
+      letter-spacing: 0.04em;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 8px 10px;
+      border: 1px solid rgba(21, 153, 78, 0.45);
+      border-radius: 999px;
+    }
+
+    #info {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      z-index: 5;
+      color: #15994e;
+      font-size: 12px;
+      opacity: 0.75;
+      letter-spacing: 0.04em;
     }
   </style>
 </head>
 
 <body>
   <button id="startButton">Start Camera</button>
+  <div id="status">waiting</div>
+  <div id="info">line vision / object detection</div>
 
   <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
 
-  <!-- TensorFlow.js -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
-
-  <!-- COCO-SSD object detection model -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
 
   <script>
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
+
     const startButton = document.getElementById("startButton");
+    const statusText = document.getElementById("status");
 
     let model;
-    let trails = [];
+    let lastPredictions = [];
+    let frameCount = 0;
+    let detecting = false;
 
-    const poeticLabels = {
-      "person": "body",
-      "cell phone": "signal",
-      "laptop": "machine",
-      "book": "memory",
-      "chair": "waiting object",
-      "bottle": "container",
-      "cup": "ritual",
-      "dog": "living presence",
-      "cat": "living presence",
-      "bird": "living presence",
-      "car": "movement",
-      "backpack": "carried life",
-      "handbag": "carried object",
-      "clock": "time",
+    const GREEN = "#15994e";
+
+    const labelMap = {
+      "person": "person",
+      "cell phone": "phone",
+      "laptop": "laptop",
+      "book": "book",
+      "chair": "chair",
+      "bottle": "bottle",
+      "cup": "cup",
+      "dog": "dog",
+      "cat": "cat",
+      "bird": "bird",
+      "car": "car",
+      "backpack": "backpack",
+      "handbag": "bag",
+      "clock": "clock",
       "tv": "screen",
-      "keyboard": "language machine",
-      "mouse": "small machine"
+      "keyboard": "keyboard",
+      "mouse": "mouse",
+      "remote": "remote",
+      "scissors": "scissors",
+      "teddy bear": "figure",
+      "vase": "vase",
+      "potted plant": "plant",
+      "dining table": "table",
+      "bed": "bed",
+      "couch": "couch",
+      "sink": "sink",
+      "refrigerator": "fridge",
+      "oven": "oven",
+      "toaster": "toaster",
+      "microwave": "microwave"
     };
 
     function resizeCanvas() {
@@ -91,26 +141,131 @@
     resizeCanvas();
 
     async function startCamera() {
-      startButton.style.display = "none";
+      try {
+        startButton.style.display = "none";
+        statusText.textContent = "loading model";
 
-      model = await cocoSsd.load();
+        console.log("Loading model...");
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "environment"
-        },
-        audio: false
-      });
+        model = await cocoSsd.load({
+          base: "mobilenet_v2"
+        });
 
-      video.srcObject = stream;
+        console.log("Model loaded:", model);
 
-      video.onloadedmetadata = () => {
-        video.play();
-        draw();
-      };
+        statusText.textContent = "starting camera";
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "environment",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+
+        video.srcObject = stream;
+
+        video.onloadedmetadata = () => {
+          video.play();
+
+          console.log("Video size:", video.videoWidth, video.videoHeight);
+
+          statusText.textContent = "camera active";
+          draw();
+        };
+      } catch (error) {
+        console.error(error);
+        statusText.textContent = "error: check camera permission";
+        startButton.style.display = "block";
+      }
     }
 
-    function drawAbstractObject(prediction, scaleX, scaleY) {
+    function drawFaintRealImage() {
+      ctx.globalAlpha = 0.04;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.globalAlpha = 1;
+    }
+
+    function drawLineImage() {
+      if (!video.videoWidth || !video.videoHeight) return;
+
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+
+      const offCanvas = document.createElement("canvas");
+      offCanvas.width = vw;
+      offCanvas.height = vh;
+
+      const offCtx = offCanvas.getContext("2d", { willReadFrequently: true });
+      offCtx.drawImage(video, 0, 0, vw, vh);
+
+      const imageData = offCtx.getImageData(0, 0, vw, vh);
+      const data = imageData.data;
+
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+
+        const brightness = (r + g + b) / 3;
+
+        if (brightness > 65 && brightness < 165) {
+          data[i] = 21;
+          data[i + 1] = 153;
+          data[i + 2] = 78;
+          data[i + 3] = 52;
+        } else if (brightness >= 165) {
+          data[i] = 255;
+          data[i + 1] = 255;
+          data[i + 2] = 255;
+          data[i + 3] = 18;
+        } else {
+          data[i] = 0;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = 10;
+        }
+      }
+
+      offCtx.putImageData(imageData, 0, 0);
+
+      ctx.globalAlpha = 0.32;
+      ctx.drawImage(offCanvas, 0, 0, canvas.width, canvas.height);
+      ctx.globalAlpha = 1;
+    }
+
+    async function updateDetection() {
+      if (!model || video.readyState !== 4 || detecting) return;
+
+      // هر ۱۰ فریم یک بار تشخیص بده تا روی آیفون کند نشه
+      if (frameCount % 10 !== 0) return;
+
+      detecting = true;
+
+      try {
+        const predictions = await model.detect(video);
+
+        console.log(predictions);
+
+        // threshold پایین‌تر برای detect کردن اشیای بیشتر
+        lastPredictions = predictions.filter(prediction => prediction.score > 0.15);
+
+        statusText.textContent = `detected: ${lastPredictions.length}`;
+      } catch (error) {
+        console.error("Detection error:", error);
+        statusText.textContent = "detection error";
+      }
+
+      detecting = false;
+    }
+
+    function drawObjectDetection(prediction) {
+      if (!video.videoWidth || !video.videoHeight) return;
+
+      const scaleX = canvas.width / video.videoWidth;
+      const scaleY = canvas.height / video.videoHeight;
+
       const [x, y, width, height] = prediction.bbox;
 
       const sx = x * scaleX;
@@ -121,88 +276,102 @@
       const cx = sx + sw / 2;
       const cy = sy + sh / 2;
 
-      const label = poeticLabels[prediction.class] || prediction.class;
+      const label = labelMap[prediction.class] || prediction.class;
+      const percent = Math.round(prediction.score * 100);
 
-      trails.push({
-        x: cx,
-        y: cy,
-        label: label,
-        life: 1
-      });
+      // اگر تشخیص خیلی ضعیف باشه، باکس نازک‌تر میشه
+      const alpha = Math.min(Math.max(prediction.score, 0.25), 0.95);
 
-      ctx.strokeStyle = "rgba(21, 153, 78, 0.8)";
-      ctx.lineWidth = 1;
-
-      // abstract rectangle
+      ctx.strokeStyle = `rgba(21, 153, 78, ${alpha})`;
+      ctx.lineWidth = 1.3;
       ctx.strokeRect(sx, sy, sw, sh);
 
-      // center point
+      // graphic corner marks
+      const corner = 20;
+      ctx.lineWidth = 2.5;
+
       ctx.beginPath();
-      ctx.arc(cx, cy, 4, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
-      ctx.fill();
 
-      // glitch lines
-      for (let i = 0; i < 8; i++) {
-        const dx1 = (Math.random() - 0.5) * 80;
-        const dy1 = (Math.random() - 0.5) * 80;
-        const dx2 = (Math.random() - 0.5) * 80;
-        const dy2 = (Math.random() - 0.5) * 80;
+      ctx.moveTo(sx, sy + corner);
+      ctx.lineTo(sx, sy);
+      ctx.lineTo(sx + corner, sy);
 
-        ctx.beginPath();
-        ctx.moveTo(cx + dx1, cy + dy1);
-        ctx.lineTo(cx + dx2, cy + dy2);
-        ctx.stroke();
-      }
+      ctx.moveTo(sx + sw - corner, sy);
+      ctx.lineTo(sx + sw, sy);
+      ctx.lineTo(sx + sw, sy + corner);
+
+      ctx.moveTo(sx + sw, sy + sh - corner);
+      ctx.lineTo(sx + sw, sy + sh);
+      ctx.lineTo(sx + sw - corner, sy + sh);
+
+      ctx.moveTo(sx + corner, sy + sh);
+      ctx.lineTo(sx, sy + sh);
+      ctx.lineTo(sx, sy + sh - corner);
+
+      ctx.stroke();
+
+      // center cross
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cx - 9, cy);
+      ctx.lineTo(cx + 9, cy);
+      ctx.moveTo(cx, cy - 9);
+      ctx.lineTo(cx, cy + 9);
+      ctx.stroke();
+
+      // slight scan line through the object
+      ctx.strokeStyle = "rgba(21, 153, 78, 0.22)";
+      ctx.lineWidth = 1;
+
+      ctx.beginPath();
+      ctx.moveTo(sx, cy);
+      ctx.lineTo(sx + sw, cy);
+      ctx.stroke();
 
       // label
-      ctx.font = "18px Arial";
-      ctx.fillStyle = "rgba(21, 153, 78, 0.95)";
-      ctx.fillText(label, sx, Math.max(sy - 10, 20));
-    }
+      const text = `${label} ${percent}%`;
 
-    function drawTrails() {
-      for (let i = trails.length - 1; i >= 0; i--) {
-        const t = trails[i];
+      ctx.font = "14px Arial";
+      const textWidth = ctx.measureText(text).width;
 
-        ctx.globalAlpha = t.life;
-        ctx.fillStyle = "rgba(21, 153, 78, 0.4)";
+      ctx.fillStyle = "rgba(0, 0, 0, 0.78)";
+      ctx.fillRect(sx, Math.max(sy - 29, 0), textWidth + 14, 24);
+
+      ctx.fillStyle = "rgba(21, 153, 78, 1)";
+      ctx.fillText(text, sx + 7, Math.max(sy - 12, 17));
+
+      // subtle object presence lines
+      ctx.strokeStyle = "rgba(21, 153, 78, 0.24)";
+      ctx.lineWidth = 1;
+
+      for (let i = 0; i < 2; i++) {
+        const dx = (Math.random() - 0.5) * 32;
+        const dy = (Math.random() - 0.5) * 32;
+
         ctx.beginPath();
-        ctx.arc(t.x, t.y, 20 * (1 - t.life + 0.2), 0, Math.PI * 2);
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + dx, cy + dy);
         ctx.stroke();
-
-        ctx.font = "12px Arial";
-        ctx.fillText(t.label, t.x + 10, t.y + 10);
-
-        t.life -= 0.01;
-
-        if (t.life <= 0) {
-          trails.splice(i, 1);
-        }
       }
-
-      ctx.globalAlpha = 1;
     }
 
     async function draw() {
-      // fade effect instead of clearing completely
-      ctx.fillStyle = "rgba(0, 0, 0, 0.12)";
+      frameCount++;
+
+      // مقدار بالاتر یعنی تصویر قبلی سریع‌تر محو می‌شود
+      ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      if (model && video.readyState === 4) {
-        const predictions = await model.detect(video);
+      if (video.readyState === 4 && video.videoWidth > 0) {
+        drawFaintRealImage();
+        drawLineImage();
 
-        const scaleX = canvas.width / video.videoWidth;
-        const scaleY = canvas.height / video.videoHeight;
+        await updateDetection();
 
-        predictions.forEach(prediction => {
-          if (prediction.score > 0.45) {
-            drawAbstractObject(prediction, scaleX, scaleY);
-          }
+        lastPredictions.forEach(prediction => {
+          drawObjectDetection(prediction);
         });
       }
-
-      drawTrails();
 
       requestAnimationFrame(draw);
     }
